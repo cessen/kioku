@@ -1,3 +1,5 @@
+//! Kioku is a growable memory arena/pool
+
 #![allow(clippy::redundant_field_names)]
 #![allow(clippy::needless_return)]
 #![allow(clippy::mut_from_ref)]
