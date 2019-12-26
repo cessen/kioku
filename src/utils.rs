@@ -11,7 +11,12 @@ pub(crate) fn alignment_offset(addr: usize, alignment: usize) -> usize {
 /// alignment).
 #[inline(always)]
 pub(crate) fn min_alignment(layout: &Layout, align: usize) -> Layout {
-    Layout::from_size_align(layout.size(), layout.align().max(align)).unwrap()
+    assert!(
+        align > 0,
+        "Invalid alignment of '0' specified for allocation"
+    );
+    Layout::from_size_align(layout.size(), layout.align().max(align))
+        .expect("Invalid non-power-of-two alignment specified for allocation")
 }
 
 /// Currently `Layout::repeat()` is unstable in `std`, so we can't use it.

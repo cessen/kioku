@@ -278,10 +278,6 @@ impl Arena {
         let alignment = layout.align();
         let size = layout.size();
 
-        // Update stats.
-        self.stat_space_allocated
-            .set(self.stat_space_allocated.get() + size);
-
         let mut blocks = self.blocks.borrow_mut();
 
         // Add the first block if we're empty.
@@ -314,6 +310,10 @@ impl Arena {
             let new_len = (start_index_proposal + size).max(cur_block.len());
             unsafe { cur_block.set_len(new_len) };
 
+            // Update stats.
+            self.stat_space_allocated
+                .set(self.stat_space_allocated.get() + size);
+
             // Return the allocation.
             unsafe { cur_block.as_mut_ptr().add(start_index_proposal) }
         }
@@ -331,17 +331,16 @@ impl Arena {
 
             // We take the minimum of the over-all arena waste percentage and
             // the current block's waste percentage because if the current
-            // block is below the threshhold, then we can move on from it
-            // without increasing the waste percentage of the arena.
+            // block is below the threshhold, then we can start a new block
+            // without cumulatively increasing the waste percentage of the
+            // whole arena.
             let waste_percentage = {
                 let w1 = ((blocks[0].capacity() - blocks[0].len()) * 100) / blocks[0].capacity();
-                let w2 = ((self.stat_space_occupied.get() - self.stat_space_allocated.get()) * 100)
+                let w2 = ((dbg!(self.stat_space_occupied.get())
+                    - dbg!(self.stat_space_allocated.get()))
+                    * 100)
                     / self.stat_space_occupied.get();
-                if w1 < w2 {
-                    w1
-                } else {
-                    w2
-                }
+                w1.min(w2)
             };
 
             // Are we making a new shared block, or a one-off for this
@@ -359,6 +358,8 @@ impl Arena {
             // Update stats.
             self.stat_space_occupied
                 .set(self.stat_space_occupied.get() + new_block_size);
+            self.stat_space_allocated
+                .set(self.stat_space_allocated.get() + size);
 
             // Add the new block.
             blocks.push(Vec::with_capacity(new_block_size));
