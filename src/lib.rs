@@ -1,7 +1,5 @@
 //! Kioku is a growable memory arena/pool
 
-// Stylistic preferences.
-#![allow(clippy::redundant_field_names)]
 // Normally I agree with this lint, but in this particular library's case it
 // just gets too noisy not use transmute.  It actually obscures intent when
 // reading the code.
@@ -33,19 +31,44 @@ use std::{
 
 use utils::{alignment_offset, min_alignment, repeat_layout};
 
-const GROWTH_FRACTION: usize = 8; // 1/N  (smaller number leads to bigger allocations)
-const DEFAULT_INITIAL_BLOCK_SIZE: usize = 1 << 10; // 1 KiB
-const DEFAULT_MAX_WASTE_PERCENTAGE: usize = 10;
-
 /// A growable memory arena for Copy types.
 ///
-/// The arena works by allocating memory in blocks of slowly increasing size.
-/// It doles out memory from the current block until an amount of memory is
-/// requested that doesn't fit in the remainder of the current block, and then
-/// allocates a new block.
+/// The arena works by internally allocating memory in large-ish blocks of
+/// memory one-at-a-time, and doling out memory from the current block in
+/// linear order until its space runs out.
 ///
-/// Additionally, it attempts to minimize wasted space through some heuristics.
-/// By default, it tries to keep memory waste within the arena below 10%.
+/// Additionally, it attempts to minimize wasted space through some heuristics
+/// based on a configurable maximum waste percentage.
+///
+/// Some contrived example usage:
+///
+/// ```rust
+/// # use kioku::Arena;
+/// let arena = Arena::new().with_block_size(1024);
+///
+/// let integer = arena.item(42);
+/// let array1 = arena.copy_slice(&[1, 2, 3, 4, 5, 42]);
+/// assert_eq!(*integer, array1[5]);
+///
+/// *integer = 16;
+/// array1[1] = 16;
+/// assert_eq!(*integer, array1[1]);
+///
+/// let character = arena.item('A');
+/// let array2 = arena.array('A', 42);
+/// assert_eq!(array2.len(), 42);
+/// assert_eq!(*character, array2[20]);
+///
+/// *character = '学';
+/// array2[30] = '学';
+/// assert_eq!(*character, array2[30]);
+/// ```
+///
+/// # Large Allocations
+///
+/// Allocations larger than the block size are handled by just allocating them
+/// separately.  Those large allocations are also owned by the arena, just like
+/// all other arena allocations, and will be freed when it gets dropped.
 ///
 /// # Custom Alignment
 ///
@@ -69,6 +92,7 @@ const DEFAULT_MAX_WASTE_PERCENTAGE: usize = 10;
 pub struct Arena {
     blocks: RefCell<Vec<Vec<MaybeUninit<u8>>>>,
     min_block_size: usize,
+    growth_strategy: GrowthStrategy,
     max_waste_percentage: usize,
     stat_space_occupied: Cell<usize>,
     stat_space_allocated: Cell<usize>,
@@ -88,41 +112,67 @@ impl fmt::Debug for Arena {
 
 impl Arena {
     /// Create a new arena with default settings.
+    ///
+    /// - Initial block size: 1 KiB
+    /// - Growth strategy: constant
+    /// - Maximum waste percentage: 20 percent
     pub fn new() -> Arena {
         Arena {
             blocks: RefCell::new(Vec::new()),
-            min_block_size: DEFAULT_INITIAL_BLOCK_SIZE,
-            max_waste_percentage: DEFAULT_MAX_WASTE_PERCENTAGE,
+            min_block_size: 1 << 10, // 1 KiB,
+            growth_strategy: GrowthStrategy::Constant,
+            max_waste_percentage: 20,
             stat_space_occupied: Cell::new(0),
             stat_space_allocated: Cell::new(0),
         }
     }
 
-    /// Create a new arena, with a specified initial block size.
-    pub fn with_initial_block_size(initial_block_size: usize) -> Arena {
-        assert!(initial_block_size > 0);
+    /// Build an arena with a specified block size in bytes.
+    pub fn with_block_size(self, block_size: usize) -> Arena {
+        assert!(
+            block_size > 0,
+            "Initial block size must be greater \
+             than zero"
+        );
+        assert!(
+            self.blocks.borrow().is_empty(),
+            "Cannot change initial block size after \
+             blocks have already been allocated"
+        );
 
         Arena {
-            blocks: RefCell::new(Vec::new()),
-            min_block_size: initial_block_size,
-            max_waste_percentage: DEFAULT_MAX_WASTE_PERCENTAGE,
-            stat_space_occupied: Cell::new(0),
-            stat_space_allocated: Cell::new(0),
+            min_block_size: block_size,
+            ..self
         }
     }
 
-    /// Create a new arena, with a specified initial block size and maximum
+    /// Build an arena with a specified initial block size and maximum
     /// waste percentage.
-    pub fn with_settings(initial_block_size: usize, max_waste_percentage: usize) -> Arena {
-        assert!(initial_block_size > 0);
-        assert!(max_waste_percentage > 0 && max_waste_percentage <= 100);
+    ///
+    /// - Recommended values are between 10 and 30.
+    /// - 100 disables waste minimization entirely, which may be appropriate for
+    ///   some use-cases.
+    /// - Values close to 0 are absolutely _not_ recommended, as that will
+    ///   likely trigger a lot of one-off non-arena allocations even for small
+    ///   allocation requests, which defeats the whole purpose of using a memory
+    ///   arena.
+    pub fn with_max_waste_percentage(self, max_waste_percentage: usize) -> Arena {
+        assert!(
+            max_waste_percentage > 0 && max_waste_percentage <= 100,
+            "The max waste percentage must be between 1 and 100"
+        );
 
         Arena {
-            blocks: RefCell::new(Vec::new()),
-            min_block_size: initial_block_size,
-            max_waste_percentage: max_waste_percentage,
-            stat_space_occupied: Cell::new(0),
-            stat_space_allocated: Cell::new(0),
+            max_waste_percentage,
+            ..self
+        }
+    }
+
+    /// Build an arena with a specified memory block growth strategy.
+    pub fn with_growth_strategy(self, growth_strategy: GrowthStrategy) -> Arena {
+        Arena {
+            growth_strategy,
+            ..self
         }
     }
 
@@ -337,10 +387,13 @@ impl Arena {
             // This is where we implement progressive block growth.  We do the
             // growth as a factor of the total arena capacity, not just the
             // current block.
-            let next_shared_size = {
-                let a = self.stat_space_occupied.get() / GROWTH_FRACTION;
-                let b = a % self.min_block_size;
-                self.min_block_size + a - b
+            let next_shared_size = match self.growth_strategy {
+                GrowthStrategy::Constant => self.min_block_size,
+                GrowthStrategy::Percentage(perc) => {
+                    let a = self.stat_space_occupied.get() / 100 * perc as usize;
+                    let b = a % self.min_block_size;
+                    self.min_block_size.max(a - b)
+                }
             };
 
             // We take the minimum of the over-all arena waste percentage and
@@ -416,9 +469,9 @@ impl Arena {
     /// references to invalid memory.  Only use this if (a) you can't use the
     /// safe version for some reason and (b) you really know what you're doing.
     ///
-    /// The safe version of this method (`clear()`) takes a mutable reference
-    /// to `self`, which ensures at compile time that there are no other
-    /// references to either the arena itself or its allocations.
+    /// The safe version of this method takes a mutable reference to `self`,
+    /// which ensures at compile time that there are no other references to
+    /// either the arena itself or its allocations.
     ///
     /// This method, on the other hand, makes no such guarantees.  It will
     /// quite happily free all of its memory even with hundreds or thousands
@@ -451,4 +504,24 @@ impl Arena {
 
     //     (occupied, allocated, blocks)
     // }
+}
+
+/// Strategy for determining the size of new blocks.
+///
+/// - `Constant`: no growth.  All blocks are the same size.
+/// - `Percentage`: block size is determined as a percentage of the current
+///                 total arena size, with the configured block size as a
+///                 minimum.  Recommended values are between 10 and 50 percent.
+///
+/// For most use-cases `Constant` is recommended.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum GrowthStrategy {
+    Constant,
+    Percentage(u8),
+}
+
+impl Default for GrowthStrategy {
+    fn default() -> GrowthStrategy {
+        GrowthStrategy::Constant
+    }
 }

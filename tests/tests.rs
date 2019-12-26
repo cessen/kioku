@@ -112,7 +112,7 @@ fn array_align_uninit_01() {
 #[test]
 fn lots_of_allocs_01() {
     // To force multiple blocks.
-    let arena = Arena::with_initial_block_size(64);
+    let arena = Arena::new().with_block_size(64);
 
     for _ in 0..512 {
         let a = arena.item('A');
@@ -123,7 +123,7 @@ fn lots_of_allocs_01() {
 #[test]
 fn big_alloc_01() {
     // To make sure larger-than-block-size allocations succeed.
-    let arena = Arena::with_initial_block_size(64);
+    let arena = Arena::new().with_block_size(64);
     let a = arena.item('A');
     let b = arena.item('B');
     let c = arena.array(['C'; 8], 32);
