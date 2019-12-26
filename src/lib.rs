@@ -1,4 +1,60 @@
-//! Kioku is a growable memory arena/pool
+//! Kioku is a memory arena allocator for Rust.
+//!
+//! The arena works by internally allocating memory in large-ish blocks of
+//! memory one-at-a-time, and doling out memory from the current block in
+//! linear order until its space runs out.
+//!
+//! Additionally, it attempts to minimize wasted space through some heuristics
+//! based on a configurable maximum waste percentage.
+//!
+//! Some contrived example usage:
+//!
+//! ```rust
+//! # use kioku::Arena;
+//! let arena = Arena::new().with_block_size(1024);
+//!
+//! let integer = arena.item(42);
+//! let array1 = arena.copy_slice(&[1, 2, 3, 4, 5, 42]);
+//! assert_eq!(*integer, array1[5]);
+//!
+//! *integer = 16;
+//! array1[1] = 16;
+//! assert_eq!(*integer, array1[1]);
+//!
+//! let character = arena.item('A');
+//! let array2 = arena.array('A', 42);
+//! assert_eq!(array2.len(), 42);
+//! assert_eq!(*character, array2[20]);
+//!
+//! *character = '学';
+//! array2[30] = '学';
+//! assert_eq!(*character, array2[30]);
+//! ```
+//!
+//! # Large Allocations
+//!
+//! Allocations larger than the block size are handled by just allocating them
+//! separately.  Those large allocations are also owned by the arena, just like
+//! all other arena allocations, and will be freed when it gets dropped.
+//!
+//! # Custom Alignment
+//!
+//! All methods with a custom alignment parameter require the alignment to be
+//! greater than zero and a power of two.  Moreover, the alignment parameter
+//! can only increase the strictness of the alignment, and will be ignored if
+//! less strict than the natural alignment of the type being allocated.
+//!
+//! Array allocation methods with alignment parameters only align the head of
+//! the array to that alignment, and otherwise follow standard array memory
+//! layout.
+//!
+//! # Zero Sized Types
+//!
+//! Zero-sized types such as `()` are unsupported.  All allocations will panic
+//! if `T` is zero-sized.
+//!
+//! However, you *can* allocate zero length arrays using the array allocation
+//! methods.  Only `T` itself must be non-zero-sized.
 
 // Normally I agree with this lint, but in this particular library's case it
 // just gets too noisy not use transmute.  It actually obscures intent when
@@ -32,63 +88,7 @@ use std::{
 
 use utils::{alignment_offset, min_alignment, repeat_layout};
 
-/// A growable memory arena for Copy types.
-///
-/// The arena works by internally allocating memory in large-ish blocks of
-/// memory one-at-a-time, and doling out memory from the current block in
-/// linear order until its space runs out.
-///
-/// Additionally, it attempts to minimize wasted space through some heuristics
-/// based on a configurable maximum waste percentage.
-///
-/// Some contrived example usage:
-///
-/// ```rust
-/// # use kioku::Arena;
-/// let arena = Arena::new().with_block_size(1024);
-///
-/// let integer = arena.item(42);
-/// let array1 = arena.copy_slice(&[1, 2, 3, 4, 5, 42]);
-/// assert_eq!(*integer, array1[5]);
-///
-/// *integer = 16;
-/// array1[1] = 16;
-/// assert_eq!(*integer, array1[1]);
-///
-/// let character = arena.item('A');
-/// let array2 = arena.array('A', 42);
-/// assert_eq!(array2.len(), 42);
-/// assert_eq!(*character, array2[20]);
-///
-/// *character = '学';
-/// array2[30] = '学';
-/// assert_eq!(*character, array2[30]);
-/// ```
-///
-/// # Large Allocations
-///
-/// Allocations larger than the block size are handled by just allocating them
-/// separately.  Those large allocations are also owned by the arena, just like
-/// all other arena allocations, and will be freed when it gets dropped.
-///
-/// # Custom Alignment
-///
-/// All methods with a custom alignment parameter require the alignment to be
-/// greater than zero and a power of two.  Moreover, the alignment parameter
-/// can only increase the strictness of the alignment, and will be ignored if
-/// less strict than the natural alignment of the type being allocated.
-///
-/// Array allocation methods with alignment parameters only align the head of
-/// the array to that alignment, and otherwise follow standard array memory
-/// layout.
-///
-/// # Zero Sized Types
-///
-/// Zero-sized types such as `()` are unsupported.  All allocations will panic
-/// if `T` is zero-sized.
-///
-/// However, you *can* allocate zero length arrays using the array allocation
-/// methods.  Only `T` itself must be non-zero-sized.
+/// A memory arena allocator.
 #[derive(Default)]
 pub struct Arena {
     blocks: RefCell<LinkedList<Vec<MaybeUninit<u8>>>>,

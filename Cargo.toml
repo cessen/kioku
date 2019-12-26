@@ -1,6 +1,6 @@
 [package]
 name = "kioku"
-version = "0.1.0"
+version = "0.2.0"
 description = "A memory pool/arena"
 documentation = "https://docs.rs/kioku"
 repository = "https://github.com/cessen/kioku"
