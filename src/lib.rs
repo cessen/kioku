@@ -24,6 +24,7 @@ mod utils;
 use std::{
     alloc::Layout,
     cell::{Cell, RefCell},
+    collections::LinkedList,
     fmt,
     mem::{align_of, size_of, transmute, MaybeUninit},
     slice,
@@ -90,7 +91,7 @@ use utils::{alignment_offset, min_alignment, repeat_layout};
 /// methods.  Only `T` itself must be non-zero-sized.
 #[derive(Default)]
 pub struct Arena {
-    blocks: RefCell<Vec<Vec<MaybeUninit<u8>>>>,
+    blocks: RefCell<LinkedList<Vec<MaybeUninit<u8>>>>,
     min_block_size: usize,
     growth_strategy: GrowthStrategy,
     max_waste_percentage: usize,
@@ -118,7 +119,7 @@ impl Arena {
     /// - Maximum waste percentage: 20 percent
     pub fn new() -> Arena {
         Arena {
-            blocks: RefCell::new(Vec::new()),
+            blocks: RefCell::new(LinkedList::new()),
             min_block_size: 1 << 10, // 1 KiB,
             growth_strategy: GrowthStrategy::Constant,
             max_waste_percentage: 20,
@@ -346,7 +347,7 @@ impl Arena {
 
         // Add the first block if we're empty.
         if blocks.is_empty() {
-            blocks.push(Vec::with_capacity(self.min_block_size));
+            blocks.push_front(Vec::with_capacity(self.min_block_size));
 
             // Update stats
             self.stat_space_occupied
@@ -355,20 +356,20 @@ impl Arena {
 
         // If we're zero-sized, just put us at the start of the current block.
         if size == 0 {
-            return blocks.first_mut().unwrap().as_mut_ptr();
+            return blocks.front_mut().unwrap().as_mut_ptr();
         }
 
         // Find our starting index for if we're allocating in the current block.
         let start_index_proposal = {
-            let cur_block = blocks.first().unwrap();
+            let cur_block = blocks.front().unwrap();
             let block_addr = cur_block.as_ptr() as usize;
             let block_filled = cur_block.len();
             block_filled + alignment_offset(block_addr + block_filled, alignment)
         };
 
         // If it will fit in the current block, use the current block.
-        if (start_index_proposal + size) <= blocks.first().unwrap().capacity() {
-            let cur_block = blocks.first_mut().unwrap();
+        if (start_index_proposal + size) <= blocks.front().unwrap().capacity() {
+            let cur_block = blocks.front_mut().unwrap();
 
             // Do the bump allocation.
             let new_len = (start_index_proposal + size).max(cur_block.len());
@@ -402,7 +403,8 @@ impl Arena {
             // without cumulatively increasing the waste percentage of the
             // whole arena.
             let waste_percentage = {
-                let w1 = ((blocks[0].capacity() - blocks[0].len()) * 100) / blocks[0].capacity();
+                let block = blocks.front().unwrap();
+                let w1 = ((block.capacity() - block.len()) * 100) / block.capacity();
                 let w2 = ((dbg!(self.stat_space_occupied.get())
                     - dbg!(self.stat_space_allocated.get()))
                     * 100)
@@ -429,18 +431,17 @@ impl Arena {
                 .set(self.stat_space_allocated.get() + size);
 
             // Add the new block.
-            blocks.push(Vec::with_capacity(new_block_size));
 
             // Get the new block.
             let new_block = {
                 if is_shared_block {
-                    // If it's shared, swap it to the front first,
-                    let block_count = blocks.len();
-                    blocks.swap(0, block_count - 1);
-                    blocks.first_mut().unwrap()
+                    // If it's shared, add to the front,
+                    blocks.push_front(Vec::with_capacity(new_block_size));
+                    blocks.front_mut().unwrap()
                 } else {
-                    // Otherwise leave it at the back.
-                    blocks.last_mut().unwrap()
+                    // Otherwise add to the the back.
+                    blocks.push_back(Vec::with_capacity(new_block_size));
+                    blocks.back_mut().unwrap()
                 }
             };
 
@@ -480,7 +481,6 @@ impl Arena {
         let mut blocks = self.blocks.borrow_mut();
 
         blocks.clear();
-        blocks.shrink_to_fit();
 
         self.stat_space_occupied.set(0);
         self.stat_space_allocated.set(0);
