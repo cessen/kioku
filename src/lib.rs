@@ -1,9 +1,25 @@
 //! Kioku is a growable memory arena/pool
 
+// Stylistic preferences.
 #![allow(clippy::redundant_field_names)]
-#![allow(clippy::needless_return)]
-#![allow(clippy::mut_from_ref)]
+// Normally I agree with this lint, but in this particular library's case it
+// just gets too noisy not use transmute.  It actually obscures intent when
+// reading the code.
 #![allow(clippy::transmute_ptr_to_ptr)]
+// Disabling this particular clippy warning requires more significant
+// explaination.
+//
+// If you look at the lint's docs, it says that this is "trivially unsound".
+// And yet we're  doing it _all over the place_ in this library.  In public
+// APIs, no less.  So what's up?
+//
+// The reason violating this lint is _usually_ trivially unsound is that it
+// allows returning multiple mutable references to _the same memory_.  However,
+// in the case of this library, every call to these methods returns a mutable
+// reference to a _new and different_ piece of memory.  Every time.  In fact,
+// that's the whole point: it's an allocator.  So in our case, this actually is
+// sound.  Thus, disabling the lint.
+#![allow(clippy::mut_from_ref)]
 
 mod utils;
 
@@ -31,7 +47,7 @@ const DEFAULT_MAX_WASTE_PERCENTAGE: usize = 10;
 /// Additionally, it attempts to minimize wasted space through some heuristics.
 /// By default, it tries to keep memory waste within the arena below 10%.
 ///
-/// # Custom Memory Alignment
+/// # Custom Alignment
 ///
 /// All methods with a custom alignment parameter require the alignment to be
 /// greater than zero and a power of two.  Moreover, the alignment parameter
@@ -74,10 +90,10 @@ impl Arena {
     /// Create a new arena with default settings.
     pub fn new() -> Arena {
         Arena {
-            blocks: RefCell::new(vec![Vec::with_capacity(DEFAULT_INITIAL_BLOCK_SIZE)]),
+            blocks: RefCell::new(Vec::new()),
             min_block_size: DEFAULT_INITIAL_BLOCK_SIZE,
             max_waste_percentage: DEFAULT_MAX_WASTE_PERCENTAGE,
-            stat_space_occupied: Cell::new(DEFAULT_INITIAL_BLOCK_SIZE),
+            stat_space_occupied: Cell::new(0),
             stat_space_allocated: Cell::new(0),
         }
     }
@@ -87,10 +103,10 @@ impl Arena {
         assert!(initial_block_size > 0);
 
         Arena {
-            blocks: RefCell::new(vec![Vec::with_capacity(initial_block_size)]),
+            blocks: RefCell::new(Vec::new()),
             min_block_size: initial_block_size,
             max_waste_percentage: DEFAULT_MAX_WASTE_PERCENTAGE,
-            stat_space_occupied: Cell::new(initial_block_size),
+            stat_space_occupied: Cell::new(0),
             stat_space_allocated: Cell::new(0),
         }
     }
@@ -102,60 +118,12 @@ impl Arena {
         assert!(max_waste_percentage > 0 && max_waste_percentage <= 100);
 
         Arena {
-            blocks: RefCell::new(vec![Vec::with_capacity(initial_block_size)]),
+            blocks: RefCell::new(Vec::new()),
             min_block_size: initial_block_size,
             max_waste_percentage: max_waste_percentage,
-            stat_space_occupied: Cell::new(initial_block_size),
+            stat_space_occupied: Cell::new(0),
             stat_space_allocated: Cell::new(0),
         }
-    }
-
-    /// Returns statistics about the current usage as a tuple:
-    /// (space occupied, space allocated, block count, large block count)
-    ///
-    /// Space occupied is the amount of real memory that the Arena
-    /// is taking up (not counting book keeping).
-    ///
-    /// Space allocated is the amount of occupied space that is
-    /// actually used.  In other words, it is the sum of the all the
-    /// allocation requests made to the arena by client code.
-    ///
-    /// Block count is the number of blocks that have been allocated.
-    pub fn stats(&self) -> (usize, usize, usize) {
-        let occupied = self.stat_space_occupied.get();
-        let allocated = self.stat_space_allocated.get();
-        let blocks = self.blocks.borrow().len();
-
-        (occupied, allocated, blocks)
-    }
-
-    /// Frees all memory currently allocated by the arena.
-    pub fn clear(&mut self) {
-        unsafe { self.clear_unchecked() }
-    }
-
-    /// Unsafe version of `clear()`, without any safetey checks.
-    ///
-    /// This method is _extremely_ unsafe. It can easily create dangling
-    /// references to invalid memory.  Only use this if (a) you can't use the
-    /// safe version for some reason and (b) you really know what you're doing.
-    ///
-    /// The safe version of this method (`clear()`) takes a mutable reference
-    /// to `self`, which ensures at compile time that there are no other
-    /// references to either the arena itself or its allocations.
-    ///
-    /// This method, on the other hand, makes no such guarantees.  It will
-    /// quite happily free all of its memory even with hundreds or thousands
-    /// of outstanding references pointing to it.
-    pub unsafe fn clear_unchecked(&self) {
-        let mut blocks = self.blocks.borrow_mut();
-
-        blocks.clear();
-        blocks.shrink_to_fit();
-        blocks.push(Vec::with_capacity(self.min_block_size));
-
-        self.stat_space_occupied.set(self.min_block_size);
-        self.stat_space_allocated.set(0);
     }
 
     //------------------------------------------------------------------------
@@ -310,97 +278,162 @@ impl Arena {
         let alignment = layout.align();
         let size = layout.size();
 
+        // Update stats.
         self.stat_space_allocated
-            .set(self.stat_space_allocated.get() + size); // Update stats
+            .set(self.stat_space_allocated.get() + size);
 
         let mut blocks = self.blocks.borrow_mut();
 
-        // If it's a zero-size allocation, just point to the beginning of the current block.
+        // Add the first block if we're empty.
+        if blocks.is_empty() {
+            blocks.push(Vec::with_capacity(self.min_block_size));
+
+            // Update stats
+            self.stat_space_occupied
+                .set(self.stat_space_occupied.get() + self.min_block_size);
+        }
+
+        // If we're zero-sized, just put us at the start of the current block.
         if size == 0 {
             return blocks.first_mut().unwrap().as_mut_ptr();
         }
-        // If it's non-zero-size.
+
+        // Find our starting index for if we're allocating in the current block.
+        let start_index_proposal = {
+            let cur_block = blocks.first().unwrap();
+            let block_addr = cur_block.as_ptr() as usize;
+            let block_filled = cur_block.len();
+            block_filled + alignment_offset(block_addr + block_filled, alignment)
+        };
+
+        // If it will fit in the current block, use the current block.
+        if (start_index_proposal + size) <= blocks.first().unwrap().capacity() {
+            let cur_block = blocks.first_mut().unwrap();
+
+            // Do the bump allocation.
+            let new_len = (start_index_proposal + size).max(cur_block.len());
+            unsafe { cur_block.set_len(new_len) };
+
+            // Return the allocation.
+            unsafe { cur_block.as_mut_ptr().add(start_index_proposal) }
+        }
+        // If it won't fit in the current block, create a new block and use that.
         else {
-            let start_index = {
-                let block_addr = blocks.first().unwrap().as_ptr() as usize;
-                let block_filled = blocks.first().unwrap().len();
-                block_filled + alignment_offset(block_addr + block_filled, alignment)
+            // Calculate the size that the next shared block should be.
+            // This is where we implement progressive block growth.  We do the
+            // growth as a factor of the total arena capacity, not just the
+            // current block.
+            let next_shared_size = {
+                let a = self.stat_space_occupied.get() / GROWTH_FRACTION;
+                let b = a % self.min_block_size;
+                self.min_block_size + a - b
             };
 
-            // If it will fit in the current block, use the current block.
-            if (start_index + size) <= blocks.first().unwrap().capacity() {
-                unsafe {
-                    blocks.first_mut().unwrap().set_len(start_index + size);
-                }
-
-                let block_ptr = blocks.first_mut().unwrap().as_mut_ptr();
-                return unsafe { block_ptr.add(start_index) };
-            }
-            // If it won't fit in the current block, create a new block and use that.
-            else {
-                let next_size = if blocks.len() >= GROWTH_FRACTION {
-                    let a = self.stat_space_occupied.get() / GROWTH_FRACTION;
-                    let b = a % self.min_block_size;
-                    if b > 0 {
-                        a - b + self.min_block_size
-                    } else {
-                        a
-                    }
+            // We take the minimum of the over-all arena waste percentage and
+            // the current block's waste percentage because if the current
+            // block is below the threshhold, then we can move on from it
+            // without increasing the waste percentage of the arena.
+            let waste_percentage = {
+                let w1 = ((blocks[0].capacity() - blocks[0].len()) * 100) / blocks[0].capacity();
+                let w2 = ((self.stat_space_occupied.get() - self.stat_space_allocated.get()) * 100)
+                    / self.stat_space_occupied.get();
+                if w1 < w2 {
+                    w1
                 } else {
-                    self.min_block_size
-                };
-
-                let waste_percentage = {
-                    let w1 =
-                        ((blocks[0].capacity() - blocks[0].len()) * 100) / blocks[0].capacity();
-                    let w2 = ((self.stat_space_occupied.get() - self.stat_space_allocated.get())
-                        * 100)
-                        / self.stat_space_occupied.get();
-                    if w1 < w2 {
-                        w1
-                    } else {
-                        w2
-                    }
-                };
-
-                // If it's a "large allocation", give it its own memory block.
-                if (size + alignment) > next_size || waste_percentage > self.max_waste_percentage {
-                    // Update stats
-                    self.stat_space_occupied
-                        .set(self.stat_space_occupied.get() + size + alignment - 1);
-
-                    blocks.push(Vec::with_capacity(size + alignment - 1));
-                    unsafe {
-                        blocks.last_mut().unwrap().set_len(size + alignment - 1);
-                    }
-
-                    let start_index =
-                        alignment_offset(blocks.last().unwrap().as_ptr() as usize, alignment);
-
-                    let block_ptr = blocks.last_mut().unwrap().as_mut_ptr();
-                    return unsafe { block_ptr.add(start_index) };
+                    w2
                 }
-                // Otherwise create a new shared block.
-                else {
-                    // Update stats
-                    self.stat_space_occupied
-                        .set(self.stat_space_occupied.get() + next_size);
+            };
 
-                    blocks.push(Vec::with_capacity(next_size));
+            // Are we making a new shared block, or a one-off for this
+            // allocation?
+            let is_shared_block = (size + alignment) <= next_shared_size
+                && waste_percentage <= self.max_waste_percentage;
+
+            // Determine the size of the new block.
+            let new_block_size = if is_shared_block {
+                next_shared_size
+            } else {
+                size + alignment - 1
+            };
+
+            // Update stats.
+            self.stat_space_occupied
+                .set(self.stat_space_occupied.get() + new_block_size);
+
+            // Add the new block.
+            blocks.push(Vec::with_capacity(new_block_size));
+
+            // Get the new block.
+            let new_block = {
+                if is_shared_block {
+                    // If it's shared, swap it to the front first,
                     let block_count = blocks.len();
                     blocks.swap(0, block_count - 1);
-
-                    let start_index =
-                        alignment_offset(blocks.first().unwrap().as_ptr() as usize, alignment);
-
-                    unsafe {
-                        blocks.first_mut().unwrap().set_len(start_index + size);
-                    }
-
-                    let block_ptr = blocks.first_mut().unwrap().as_mut_ptr();
-                    return unsafe { block_ptr.add(start_index) };
+                    blocks.first_mut().unwrap()
+                } else {
+                    // Otherwise leave it at the back.
+                    blocks.last_mut().unwrap()
                 }
-            }
+            };
+
+            // Do the bump allocation.
+            let start_index = alignment_offset(new_block.as_ptr() as usize, alignment);
+            unsafe { new_block.set_len(start_index + size) };
+
+            // Return the allocation.
+            unsafe { new_block.as_mut_ptr().add(start_index) }
         }
     }
+
+    //------------------------------------------------------------------------
+    // Misc methods.
+
+    /// Frees all memory currently allocated by the arena.
+    pub fn clear(&mut self) {
+        unsafe { self.clear_unchecked() }
+    }
+
+    /// Unsafe version of `clear()`, without any safetey checks.
+    ///
+    /// # Safety
+    ///
+    /// This method is _extremely_ unsafe. It can easily create dangling
+    /// references to invalid memory.  Only use this if (a) you can't use the
+    /// safe version for some reason and (b) you really know what you're doing.
+    ///
+    /// The safe version of this method (`clear()`) takes a mutable reference
+    /// to `self`, which ensures at compile time that there are no other
+    /// references to either the arena itself or its allocations.
+    ///
+    /// This method, on the other hand, makes no such guarantees.  It will
+    /// quite happily free all of its memory even with hundreds or thousands
+    /// of outstanding references pointing to it.
+    pub unsafe fn clear_unchecked(&self) {
+        let mut blocks = self.blocks.borrow_mut();
+
+        blocks.clear();
+        blocks.shrink_to_fit();
+
+        self.stat_space_occupied.set(0);
+        self.stat_space_allocated.set(0);
+    }
+
+    // /// Returns statistics about the current usage as a tuple:
+    // /// (space occupied, space allocated, block count, large block count)
+    // ///
+    // /// Space occupied is the amount of real memory that the Arena
+    // /// is taking up (not counting book keeping).
+    // ///
+    // /// Space allocated is the amount of occupied space that is
+    // /// actually used.  In other words, it is the sum of the all the
+    // /// allocation requests made to the arena by client code.
+    // ///
+    // /// Block count is the number of blocks that have been allocated.
+    // pub fn stats(&self) -> (usize, usize, usize) {
+    //     let occupied = self.stat_space_occupied.get();
+    //     let allocated = self.stat_space_allocated.get();
+    //     let blocks = self.blocks.borrow().len();
+
+    //     (occupied, allocated, blocks)
+    // }
 }
