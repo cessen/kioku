@@ -26,6 +26,15 @@ fn copy_slice_01() {
 }
 
 #[test]
+fn copy_str_01() {
+    let arena = Arena::new();
+    let a = arena.copy_str("Hello there! こんにちは！");
+    let b = arena.copy_str("");
+    assert_eq!("Hello there! こんにちは！", a);
+    assert_eq!("", b);
+}
+
+#[test]
 fn item_align_01() {
     let arena = Arena::new();
     let a = arena.item_align('A', 64);
@@ -105,7 +114,7 @@ fn lots_of_allocs_01() {
     // To force multiple blocks.
     let arena = Arena::with_initial_block_size(64);
 
-    for _ in 0..4096 {
+    for _ in 0..512 {
         let a = arena.item('A');
         assert_eq!('A', *a);
     }

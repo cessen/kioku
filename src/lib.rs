@@ -158,13 +158,27 @@ impl Arena {
     pub fn copy_slice<T: Copy>(&self, slice: &[T]) -> &mut [T] {
         let memory = self.array_uninit(slice.len());
 
-        for (v, slice) in memory.iter_mut().zip(slice.iter()) {
+        for (v, slice_item) in memory.iter_mut().zip(slice.iter()) {
             unsafe {
-                *v.as_mut_ptr() = *slice;
+                *v.as_mut_ptr() = *slice_item;
             }
         }
 
         unsafe { transmute(memory) }
+    }
+
+    /// Allocates a `str` initialized to the contents of `text`.
+    #[inline]
+    pub fn copy_str(&self, text: &str) -> &mut str {
+        let memory = self.array_uninit::<u8>(text.len());
+
+        for (byte, text_byte) in memory.iter_mut().zip(text.as_bytes().iter()) {
+            unsafe {
+                *byte.as_mut_ptr() = *text_byte;
+            }
+        }
+
+        unsafe { std::str::from_utf8_unchecked_mut(transmute(memory)) }
     }
 
     //------------------------------------------------------------------------
@@ -199,12 +213,12 @@ impl Arena {
     /// Allocates a `[T]` initialized to the contents of `slice`, aligned to at
     /// least `align` bytes.
     #[inline]
-    pub fn copy_slice_align<T: Copy>(&self, other: &[T], align: usize) -> &mut [T] {
-        let memory = self.array_align_uninit(other.len(), align);
+    pub fn copy_slice_align<T: Copy>(&self, slice: &[T], align: usize) -> &mut [T] {
+        let memory = self.array_align_uninit(slice.len(), align);
 
-        for (v, other) in memory.iter_mut().zip(other.iter()) {
+        for (v, slice_item) in memory.iter_mut().zip(slice.iter()) {
             unsafe {
-                *v.as_mut_ptr() = *other;
+                *v.as_mut_ptr() = *slice_item;
             }
         }
 
