@@ -6,19 +6,58 @@
 #![allow(clippy::transmute_ptr_to_ptr)]
 
 use std::{
+    alloc::Layout,
     cell::{Cell, RefCell},
-    cmp::max,
     fmt,
     mem::{align_of, size_of, transmute, MaybeUninit},
     slice,
 };
 
 const GROWTH_FRACTION: usize = 8; // 1/N  (smaller number leads to bigger allocations)
-const DEFAULT_MIN_BLOCK_SIZE: usize = 1 << 10; // 1 KiB
+const DEFAULT_INITIAL_BLOCK_SIZE: usize = 1 << 10; // 1 KiB
 const DEFAULT_MAX_WASTE_PERCENTAGE: usize = 10;
 
+#[inline(always)]
 fn alignment_offset(addr: usize, alignment: usize) -> usize {
     (alignment - (addr % alignment)) % alignment
+}
+
+/// Currently `Layout::repeat()` is unstable in `std`, so we can't use it.
+/// This is essentially a copy of that code, but it panics instead of returning
+/// an error.  That difference aside, see the documentation of
+/// `Layout::repeat()` for details.
+///
+/// The short version is: this is used for allocating arrays.
+///
+/// TODO: replace with a call to `Layout::repeat()` once that's stablized.
+#[inline]
+fn repeat_layout(layout: &Layout, n: usize) -> Layout {
+    fn padding_needed_for(layout: &Layout, align: usize) -> usize {
+        let len = layout.size();
+        let len_rounded_up = len.wrapping_add(align).wrapping_sub(1) & !align.wrapping_sub(1);
+        len_rounded_up.wrapping_sub(len)
+    }
+
+    let padded_size = layout
+        .size()
+        .checked_add(padding_needed_for(layout, layout.align()))
+        .unwrap();
+    let alloc_size = padded_size.checked_mul(n).unwrap();
+
+    unsafe {
+        // layout.align is already known to be valid and alloc_size has been
+        // padded already.
+        Layout::from_size_align_unchecked(alloc_size, layout.align())
+    }
+}
+
+/// Creates a new layout aligned to at least `align` bytes.
+///
+/// Panics if the resulting `Layout` would be invalid (e.g. non-power-of-two
+/// alignment).
+#[inline(always)]
+fn min_alignment(layout: &Layout, align: usize) -> Layout {
+    Layout::from_size_align(layout.size(), layout.align().max(align)).unwrap()
 }
 
 /// A growable memory arena for Copy types.
@@ -55,38 +94,38 @@ impl Arena {
     /// Create a new arena, with default minimum block size.
     pub fn new() -> Arena {
         Arena {
-            blocks: RefCell::new(vec![Vec::with_capacity(DEFAULT_MIN_BLOCK_SIZE)]),
-            min_block_size: DEFAULT_MIN_BLOCK_SIZE,
+            blocks: RefCell::new(vec![Vec::with_capacity(DEFAULT_INITIAL_BLOCK_SIZE)]),
+            min_block_size: DEFAULT_INITIAL_BLOCK_SIZE,
             max_waste_percentage: DEFAULT_MAX_WASTE_PERCENTAGE,
-            stat_space_occupied: Cell::new(DEFAULT_MIN_BLOCK_SIZE),
+            stat_space_occupied: Cell::new(DEFAULT_INITIAL_BLOCK_SIZE),
             stat_space_allocated: Cell::new(0),
         }
     }
 
-    /// Create a new arena, with a specified minimum block size.
-    pub fn with_min_block_size(min_block_size: usize) -> Arena {
-        assert!(min_block_size > 0);
+    /// Create a new arena, with a specified initial block size.
+    pub fn with_initial_block_size(initial_block_size: usize) -> Arena {
+        assert!(initial_block_size > 0);
 
         Arena {
-            blocks: RefCell::new(vec![Vec::with_capacity(min_block_size)]),
-            min_block_size: min_block_size,
+            blocks: RefCell::new(vec![Vec::with_capacity(initial_block_size)]),
+            min_block_size: initial_block_size,
             max_waste_percentage: DEFAULT_MAX_WASTE_PERCENTAGE,
-            stat_space_occupied: Cell::new(min_block_size),
+            stat_space_occupied: Cell::new(initial_block_size),
             stat_space_allocated: Cell::new(0),
         }
     }
 
-    /// Create a new arena, with a specified minimum block size and maximum
+    /// Create a new arena, with a specified initial block size and maximum
     /// waste percentage.
-    pub fn with_settings(min_block_size: usize, max_waste_percentage: usize) -> Arena {
-        assert!(min_block_size > 0);
+    pub fn with_settings(initial_block_size: usize, max_waste_percentage: usize) -> Arena {
+        assert!(initial_block_size > 0);
         assert!(max_waste_percentage > 0 && max_waste_percentage <= 100);
 
         Arena {
-            blocks: RefCell::new(vec![Vec::with_capacity(min_block_size)]),
-            min_block_size: min_block_size,
+            blocks: RefCell::new(vec![Vec::with_capacity(initial_block_size)]),
+            min_block_size: initial_block_size,
             max_waste_percentage: max_waste_percentage,
-            stat_space_occupied: Cell::new(min_block_size),
+            stat_space_occupied: Cell::new(initial_block_size),
             stat_space_allocated: Cell::new(0),
         }
     }
@@ -113,9 +152,11 @@ impl Arena {
     /// Frees all memory currently allocated by the arena, resetting itself to
     /// start fresh.
     ///
-    /// CAUTION: this is unsafe because it does NOT ensure that all references
-    /// to the data are gone, so this can potentially lead to dangling
-    /// references.
+    /// # Safety
+    ///
+    /// This is unsafe because it does NOT ensure that all references
+    /// to the freed data are gone, so this can easily lead to dangling
+    /// references to invalid memory.
     pub unsafe fn free_all_and_reset(&self) {
         let mut blocks = self.blocks.borrow_mut();
 
@@ -129,6 +170,7 @@ impl Arena {
 
     /// Allocates memory for and initializes a type T, returning a mutable
     /// reference to it.
+    #[inline]
     pub fn alloc<T: Copy>(&self, value: T) -> &mut T {
         let memory = self.alloc_uninitialized();
         unsafe {
@@ -142,6 +184,7 @@ impl Arena {
     ///
     /// Additionally, the allocation will be made with the given byte alignment
     /// or the type's inherent alignment, whichever is greater.
+    #[inline]
     pub fn alloc_with_alignment<T: Copy>(&self, value: T, align: usize) -> &mut T {
         let memory = self.alloc_uninitialized_with_alignment(align);
         unsafe {
@@ -154,10 +197,14 @@ impl Arena {
     ///
     /// CAUTION: the memory returned is uninitialized.  Make sure to initalize
     /// before using!
+    #[inline]
     pub fn alloc_uninitialized<T: Copy>(&self) -> &mut MaybeUninit<T> {
-        assert!(size_of::<T>() > 0);
+        assert!(
+            size_of::<T>() > 0,
+            "`Arena` does not support zero-sized types."
+        );
 
-        let memory = self.alloc_raw(size_of::<T>(), align_of::<T>()) as *mut MaybeUninit<T>;
+        let memory = self.alloc_raw(&Layout::new::<T>()) as *mut MaybeUninit<T>;
 
         unsafe { memory.as_mut().unwrap() }
     }
@@ -169,17 +216,21 @@ impl Arena {
     ///
     /// CAUTION: the memory returned is uninitialized.  Make sure to initalize
     /// before using!
+    #[inline]
     pub fn alloc_uninitialized_with_alignment<T: Copy>(&self, align: usize) -> &mut MaybeUninit<T> {
-        assert!(size_of::<T>() > 0);
+        assert!(
+            size_of::<T>() > 0,
+            "`Arena` does not support zero-sized types."
+        );
 
-        let memory =
-            self.alloc_raw(size_of::<T>(), max(align, align_of::<T>())) as *mut MaybeUninit<T>;
-
+        let layout = min_alignment(&Layout::new::<T>(), align);
+        let memory = self.alloc_raw(&layout) as *mut MaybeUninit<T>;
         unsafe { memory.as_mut().unwrap() }
     }
 
     /// Allocates memory for `len` values of type `T`, returning a mutable
     /// slice to it.  All elements are initialized to the given `value`.
+    #[inline]
     pub fn alloc_array<T: Copy>(&self, len: usize, value: T) -> &mut [T] {
         let memory = self.alloc_array_uninitialized(len);
 
@@ -197,6 +248,7 @@ impl Arena {
     ///
     /// Additionally, the allocation will be made with the given byte alignment
     /// or the type's inherent alignment, whichever is greater.
+    #[inline]
     pub fn alloc_array_with_alignment<T: Copy>(
         &self,
         len: usize,
@@ -216,6 +268,11 @@ impl Arena {
 
     /// Allocates and initializes memory to duplicate the given slice,
     /// returning a mutable slice to the new copy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `T` is zero-sized (unsupported).
+    #[inline]
     pub fn copy_slice<T: Copy>(&self, other: &[T]) -> &mut [T] {
         let memory = self.alloc_array_uninitialized(other.len());
 
@@ -231,8 +288,13 @@ impl Arena {
     /// Allocates and initializes memory to duplicate the given slice,
     /// returning a mutable slice to the new copy.
     ///
-    /// Additionally, the allocation will be made with the given byte alignment
-    /// or the type's inherent alignment, whichever is greater.
+    /// Additionally, the start of array itself will be aligned to at least the
+    /// given byte alignment.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `T` is zero-sized (unsupported).
+    #[inline]
     pub fn copy_slice_with_alignment<T: Copy>(&self, other: &[T], align: usize) -> &mut [T] {
         let memory = self.alloc_array_uninitialized_with_alignment(other.len(), align);
 
@@ -245,60 +307,60 @@ impl Arena {
         unsafe { transmute(memory) }
     }
 
-    /// Allocates memory for `len` values of type `T`, returning a mutable
-    /// slice to it.
+    /// Allocates uninitialized memory for `len` values of type `T`, returning
+    /// a mutable slice to it.
     ///
-    /// CAUTION: the memory returned is uninitialized.  Make sure to initalize
-    /// before using!
+    /// # Panics
+    ///
+    /// Panics if `T` is zero-sized (unsupported).
+    #[inline]
     pub fn alloc_array_uninitialized<T: Copy>(&self, len: usize) -> &mut [MaybeUninit<T>] {
-        assert!(size_of::<T>() > 0);
-
-        let array_mem_size = {
-            let alignment_padding = alignment_offset(size_of::<T>(), align_of::<T>());
-            let aligned_type_size = size_of::<T>() + alignment_padding;
-            aligned_type_size * len
-        };
-
-        let memory = self.alloc_raw(array_mem_size, align_of::<T>()) as *mut MaybeUninit<T>;
-
-        unsafe { slice::from_raw_parts_mut(memory, len) }
+        self.alloc_array_uninitialized_with_alignment(len, align_of::<T>())
     }
 
-    /// Allocates memory for `len` values of type `T`, returning a mutable
-    /// slice to it.
+    /// Allocates uninitialized memory for `len` values of type `T`, returning
+    /// a mutable uninitialized slice to it.
     ///
-    /// Additionally, the allocation will be made with the given byte alignment
-    /// or the type's inherent alignment, whichever is greater.
+    /// Additionally, the start of array itself will be aligned to at least the
+    /// given byte alignment.
     ///
-    /// CAUTION: the memory returned is uninitialized.  Make sure to initalize
-    /// before using!
+    /// # Panics
+    ///
+    /// Panics if `T` is zero-sized (unsupported).
+    #[inline]
     pub fn alloc_array_uninitialized_with_alignment<T: Copy>(
         &self,
         len: usize,
-        align: usize,
+        array_start_alignment: usize,
     ) -> &mut [MaybeUninit<T>] {
-        assert!(size_of::<T>() > 0);
+        assert!(
+            size_of::<T>() > 0,
+            "`Arena` does not support zero-sized types."
+        );
 
-        let array_mem_size = {
-            let alignment_padding = alignment_offset(size_of::<T>(), align_of::<T>());
-            let aligned_type_size = size_of::<T>() + alignment_padding;
-            aligned_type_size * len
-        };
-
-        let memory =
-            self.alloc_raw(array_mem_size, max(align, align_of::<T>())) as *mut MaybeUninit<T>;
-
+        let layout = min_alignment(
+            &repeat_layout(&Layout::new::<T>(), len),
+            array_start_alignment,
+        );
+        let memory = self.alloc_raw(&layout) as *mut MaybeUninit<T>;
         unsafe { slice::from_raw_parts_mut(memory, len) }
     }
 
-    /// Allocates space with a given size and alignment.
+    /// Allocates space with the given memory layout.
     ///
-    /// This is the work-horse code of the Arena.
+    /// Returns a mutable pointer to the start of the uninitialized bytes.
     ///
-    /// CAUTION: this returns uninitialized memory.  Make sure to initialize
-    /// the memory after calling.
-    fn alloc_raw(&self, size: usize, alignment: usize) -> *mut MaybeUninit<u8> {
-        assert!(alignment > 0);
+    /// # Safety
+    ///
+    /// Although this function is not itself unsafe, it is very easy to
+    /// accidentally do unsafe things with the returned pointer.  In
+    /// particular, only memory within the size of the requested layout is
+    /// valid, and the returned allocation is only valid for as long as the
+    /// `Arena` itself is.  The other methods on `Arena` protect against this
+    /// by using references or slices with appropriate lifetimes.
+    fn alloc_raw(&self, layout: &Layout) -> *mut MaybeUninit<u8> {
+        let alignment = layout.align();
+        let size = layout.size();
 
         self.stat_space_allocated
             .set(self.stat_space_allocated.get() + size); // Update stats
