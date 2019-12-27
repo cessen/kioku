@@ -57,14 +57,14 @@
 //! methods.  Only `T` itself must be non-zero-sized.
 
 // Normally I agree with this lint, but in this particular library's case it
-// just gets too noisy not use transmute.  It actually obscures intent when
+// just gets too noisy not using transmute.  It actually obscures intent when
 // reading the code.
 #![allow(clippy::transmute_ptr_to_ptr)]
 // Disabling this particular clippy warning requires more significant
 // explaination.
 //
 // If you look at the lint's docs, it says that this is "trivially unsound".
-// And yet we're  doing it _all over the place_ in this library.  In public
+// And yet we're doing it _all over the place_ in this library.  In public
 // APIs, no less.  So what's up?
 //
 // The reason violating this lint is _usually_ trivially unsound is that it
