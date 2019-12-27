@@ -13,7 +13,7 @@
 //! # use kioku::Arena;
 //! let arena = Arena::new().with_block_size(1024);
 //!
-//! let integer = arena.item(42);
+//! let integer = arena.alloc(42);
 //! let array1 = arena.copy_slice(&[1, 2, 3, 4, 5, 42]);
 //! assert_eq!(*integer, array1[5]);
 //!
@@ -21,8 +21,8 @@
 //! array1[1] = 16;
 //! assert_eq!(*integer, array1[1]);
 //!
-//! let character = arena.item('A');
-//! let array2 = arena.array('A', 42);
+//! let character = arena.alloc('A');
+//! let array2 = arena.alloc_array('A', 42);
 //! assert_eq!(array2.len(), 42);
 //! assert_eq!(*character, array2[20]);
 //!
@@ -82,7 +82,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::LinkedList,
     fmt,
-    mem::{align_of, size_of, transmute, MaybeUninit},
+    mem::{size_of, transmute, MaybeUninit},
     slice,
 };
 
@@ -182,8 +182,8 @@ impl Arena {
 
     /// Allocates a `T` initialized to `value`
     #[inline]
-    pub fn item<T: Copy>(&self, value: T) -> &mut T {
-        let memory = self.item_uninit();
+    pub fn alloc<T: Copy>(&self, value: T) -> &mut T {
+        let memory = self.alloc_uninit();
         unsafe {
             *memory.as_mut_ptr() = value;
         }
@@ -192,8 +192,8 @@ impl Arena {
 
     /// Allocates a `[T]` with all elements initialized to `value`.
     #[inline]
-    pub fn array<T: Copy>(&self, value: T, len: usize) -> &mut [T] {
-        let memory = self.array_uninit(len);
+    pub fn alloc_array<T: Copy>(&self, value: T, len: usize) -> &mut [T] {
+        let memory = self.alloc_array_uninit(len);
 
         for v in memory.iter_mut() {
             unsafe {
@@ -207,7 +207,7 @@ impl Arena {
     /// Allocates a `[T]` initialized to the contents of `slice`.
     #[inline]
     pub fn copy_slice<T: Copy>(&self, slice: &[T]) -> &mut [T] {
-        let memory = self.array_uninit(slice.len());
+        let memory = self.alloc_array_uninit(slice.len());
 
         for (v, slice_item) in memory.iter_mut().zip(slice.iter()) {
             unsafe {
@@ -221,7 +221,7 @@ impl Arena {
     /// Allocates a `str` initialized to the contents of `text`.
     #[inline]
     pub fn copy_str(&self, text: &str) -> &mut str {
-        let memory = self.array_uninit::<u8>(text.len());
+        let memory = self.alloc_array_uninit::<u8>(text.len());
 
         for (byte, text_byte) in memory.iter_mut().zip(text.as_bytes().iter()) {
             unsafe {
@@ -238,8 +238,8 @@ impl Arena {
     /// Allocates a `T` initialized to `value`, aligned to at least `align`
     /// bytes.
     #[inline]
-    pub fn item_align<T: Copy>(&self, value: T, align: usize) -> &mut T {
-        let memory = self.item_align_uninit(align);
+    pub fn alloc_align<T: Copy>(&self, value: T, align: usize) -> &mut T {
+        let memory = self.alloc_align_uninit(align);
         unsafe {
             *memory.as_mut_ptr() = value;
         }
@@ -249,8 +249,8 @@ impl Arena {
     /// Allocates a `[T]` with all elements initialized to `value`, aligned to
     /// at least `align` bytes.
     #[inline]
-    pub fn array_align<T: Copy>(&self, value: T, len: usize, align: usize) -> &mut [T] {
-        let memory = self.array_align_uninit(len, align);
+    pub fn alloc_array_align<T: Copy>(&self, value: T, len: usize, align: usize) -> &mut [T] {
+        let memory = self.alloc_array_align_uninit(len, align);
 
         for v in memory.iter_mut() {
             unsafe {
@@ -265,7 +265,7 @@ impl Arena {
     /// least `align` bytes.
     #[inline]
     pub fn copy_slice_align<T: Copy>(&self, slice: &[T], align: usize) -> &mut [T] {
-        let memory = self.array_align_uninit(slice.len(), align);
+        let memory = self.alloc_array_align_uninit(slice.len(), align);
 
         for (v, slice_item) in memory.iter_mut().zip(slice.iter()) {
             unsafe {
@@ -281,7 +281,7 @@ impl Arena {
 
     /// Allocates an uninitialized `T`.
     #[inline]
-    pub fn item_uninit<T: Copy>(&self) -> &mut MaybeUninit<T> {
+    pub fn alloc_uninit<T: Copy>(&self) -> &mut MaybeUninit<T> {
         assert!(
             size_of::<T>() > 0,
             "`Arena` does not support zero-sized types."
@@ -294,13 +294,20 @@ impl Arena {
 
     /// Allocates a uninitialized `[T]`.
     #[inline]
-    pub fn array_uninit<T: Copy>(&self, len: usize) -> &mut [MaybeUninit<T>] {
-        self.array_align_uninit(len, align_of::<T>())
+    pub fn alloc_array_uninit<T: Copy>(&self, len: usize) -> &mut [MaybeUninit<T>] {
+        assert!(
+            size_of::<T>() > 0,
+            "`Arena` does not support zero-sized types."
+        );
+
+        let layout = &repeat_layout(&Layout::new::<T>(), len);
+        let memory = self.alloc_raw(&layout) as *mut MaybeUninit<T>;
+        unsafe { slice::from_raw_parts_mut(memory, len) }
     }
 
     /// Allocates an uninitialized `T`, aligned to at least `align` bytes.
     #[inline]
-    pub fn item_align_uninit<T: Copy>(&self, align: usize) -> &mut MaybeUninit<T> {
+    pub fn alloc_align_uninit<T: Copy>(&self, align: usize) -> &mut MaybeUninit<T> {
         assert!(
             size_of::<T>() > 0,
             "`Arena` does not support zero-sized types."
@@ -313,7 +320,11 @@ impl Arena {
 
     /// Allocates a uninitialized `[T]`, aligned to at least `align` bytes.
     #[inline]
-    pub fn array_align_uninit<T: Copy>(&self, len: usize, align: usize) -> &mut [MaybeUninit<T>] {
+    pub fn alloc_array_align_uninit<T: Copy>(
+        &self,
+        len: usize,
+        align: usize,
+    ) -> &mut [MaybeUninit<T>] {
         assert!(
             size_of::<T>() > 0,
             "`Arena` does not support zero-sized types."

@@ -14,7 +14,7 @@ Some contrived example usage:
 ```rust
 let arena = Arena::new().with_block_size(1024);
 
-let integer = arena.item(42);
+let integer = arena.alloc(42);
 let array1 = arena.copy_slice(&[1, 2, 3, 4, 5, 42]);
 assert_eq!(*integer, array1[5]);
 
@@ -22,8 +22,8 @@ assert_eq!(*integer, array1[5]);
 array1[1] = 16;
 assert_eq!(*integer, array1[1]);
 
-let character = arena.item('A');
-let array2 = arena.array('A', 42);
+let character = arena.alloc('A');
+let array2 = arena.alloc_array('A', 42);
 assert_eq!(array2.len(), 42);
 assert_eq!(*character, array2[20]);
 
