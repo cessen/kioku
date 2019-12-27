@@ -147,8 +147,7 @@ impl Arena {
         }
     }
 
-    /// Build an arena with a specified initial block size and maximum
-    /// waste percentage.
+    /// Build an arena with a specified maximum waste percentage.
     ///
     /// - Recommended values are between 10 and 30.
     /// - 100 disables waste minimization entirely, which may be appropriate for
