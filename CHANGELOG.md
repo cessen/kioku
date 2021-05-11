@@ -4,6 +4,13 @@
 ## [Unreleased]
 
 
+## [0.3.1] - 2021-05-11
+
+### Changes
+
+- Remove debug printouts, which had been accidentally left in.
+
+
 ## [0.3.0] - 2019-12-27
 
 ### Changes

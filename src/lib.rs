@@ -415,9 +415,7 @@ impl Arena {
             let waste_percentage = {
                 let block = blocks.front().unwrap();
                 let w1 = ((block.capacity() - block.len()) * 100) / block.capacity();
-                let w2 = ((dbg!(self.stat_space_occupied.get())
-                    - dbg!(self.stat_space_allocated.get()))
-                    * 100)
+                let w2 = ((self.stat_space_occupied.get() - self.stat_space_allocated.get()) * 100)
                     / self.stat_space_occupied.get();
                 w1.min(w2)
             };
