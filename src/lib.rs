@@ -282,7 +282,7 @@ impl Arena {
             "`Arena` does not support zero-sized types."
         );
 
-        let memory = self.alloc_raw(&Layout::new::<T>()) as *mut MaybeUninit<T>;
+        let memory = self.alloc_raw(Layout::new::<T>()) as *mut MaybeUninit<T>;
 
         unsafe { memory.as_mut().unwrap() }
     }
@@ -295,8 +295,7 @@ impl Arena {
             "`Arena` does not support zero-sized types."
         );
 
-        let layout = Layout::array::<T>(len).unwrap();
-        let memory = self.alloc_raw(&layout) as *mut MaybeUninit<T>;
+        let memory = self.alloc_raw(Layout::array::<T>(len).unwrap()) as *mut MaybeUninit<T>;
         unsafe { slice::from_raw_parts_mut(memory, len) }
     }
 
@@ -312,8 +311,8 @@ impl Arena {
             "Invalid alignment: not a power of two."
         );
 
-        let layout = Layout::new::<T>().align_to(align).unwrap();
-        let memory = self.alloc_raw(&layout) as *mut MaybeUninit<T>;
+        let memory =
+            self.alloc_raw(Layout::new::<T>().align_to(align).unwrap()) as *mut MaybeUninit<T>;
         unsafe { memory.as_mut().unwrap() }
     }
 
@@ -333,8 +332,8 @@ impl Arena {
             "Invalid alignment: not a power of two."
         );
 
-        let layout = Layout::array::<T>(len).unwrap().align_to(align).unwrap();
-        let memory = self.alloc_raw(&layout) as *mut MaybeUninit<T>;
+        let memory = self.alloc_raw(Layout::array::<T>(len).unwrap().align_to(align).unwrap())
+            as *mut MaybeUninit<T>;
         unsafe { slice::from_raw_parts_mut(memory, len) }
     }
 
@@ -353,7 +352,7 @@ impl Arena {
     /// `Arena` itself is.  The other allocation methods all protect against
     /// those issues by returning references or slices with appropriate
     /// lifetimes.
-    pub fn alloc_raw(&self, layout: &Layout) -> *mut MaybeUninit<u8> {
+    pub fn alloc_raw(&self, layout: Layout) -> *mut MaybeUninit<u8> {
         #[inline(always)]
         fn alignment_offset(addr: usize, alignment: usize) -> usize {
             (alignment - (addr % alignment)) % alignment
