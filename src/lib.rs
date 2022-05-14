@@ -147,7 +147,7 @@ impl Arena {
     ///
     /// - Recommended values are between 10 and 30.
     /// - 100 disables waste minimization entirely, which may be appropriate for
-    ///   some use-cases.
+    ///   some use cases.
     /// - Values close to 0 are absolutely _not_ recommended, as that will
     ///   likely trigger a lot of one-off non-arena allocations even for small
     ///   allocation requests, which defeats the whole purpose of using a memory
@@ -478,7 +478,7 @@ impl Arena {
         unsafe { self.clear_unchecked() }
     }
 
-    /// Unsafe version of `clear()`, without any safetey checks.
+    /// Unsafe version of `clear()`, without any safety checks.
     ///
     /// # Safety
     ///
@@ -529,7 +529,7 @@ impl Arena {
 ///                 total arena size, with the configured block size as a
 ///                 minimum.  Recommended values are between 10 and 50 percent.
 ///
-/// For most use-cases `Constant` is recommended.
+/// For most use cases `Constant` is recommended.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum GrowthStrategy {
     Constant,
