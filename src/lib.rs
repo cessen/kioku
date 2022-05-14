@@ -75,8 +75,6 @@
 // sound.  Thus, disabling the lint.
 #![allow(clippy::mut_from_ref)]
 
-mod utils;
-
 use std::{
     alloc::Layout,
     cell::{Cell, RefCell},
@@ -85,8 +83,6 @@ use std::{
     mem::{size_of, transmute, MaybeUninit},
     slice,
 };
-
-use utils::{alignment_offset, min_alignment, repeat_layout};
 
 /// A memory arena allocator.
 #[derive(Default)]
@@ -299,7 +295,7 @@ impl Arena {
             "`Arena` does not support zero-sized types."
         );
 
-        let layout = &repeat_layout(&Layout::new::<T>(), len);
+        let layout = Layout::array::<T>(len).unwrap();
         let memory = self.alloc_raw(&layout) as *mut MaybeUninit<T>;
         unsafe { slice::from_raw_parts_mut(memory, len) }
     }
@@ -311,8 +307,12 @@ impl Arena {
             size_of::<T>() > 0,
             "`Arena` does not support zero-sized types."
         );
+        assert!(
+            align.is_power_of_two(),
+            "Invalid alignment: not a power of two."
+        );
 
-        let layout = min_alignment(&Layout::new::<T>(), align);
+        let layout = Layout::new::<T>().align_to(align).unwrap();
         let memory = self.alloc_raw(&layout) as *mut MaybeUninit<T>;
         unsafe { memory.as_mut().unwrap() }
     }
@@ -328,8 +328,12 @@ impl Arena {
             size_of::<T>() > 0,
             "`Arena` does not support zero-sized types."
         );
+        assert!(
+            align.is_power_of_two(),
+            "Invalid alignment: not a power of two."
+        );
 
-        let layout = min_alignment(&repeat_layout(&Layout::new::<T>(), len), align);
+        let layout = Layout::array::<T>(len).unwrap().align_to(align).unwrap();
         let memory = self.alloc_raw(&layout) as *mut MaybeUninit<T>;
         unsafe { slice::from_raw_parts_mut(memory, len) }
     }
@@ -350,6 +354,11 @@ impl Arena {
     /// those issues by returning references or slices with appropriate
     /// lifetimes.
     pub fn alloc_raw(&self, layout: &Layout) -> *mut MaybeUninit<u8> {
+        #[inline(always)]
+        fn alignment_offset(addr: usize, alignment: usize) -> usize {
+            (alignment - (addr % alignment)) % alignment
+        }
+
         let alignment = layout.align();
         let size = layout.size();
 
